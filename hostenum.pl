@@ -1,20 +1,42 @@
 #!/usr/bin/perl
 #
-# Host Enumeration
+# hostenum - Host Enumeration Information Gathering Collation Script
+# Copyright (C) 2019 Benedict Lam-Hang
 #
-# Using nbtscan, nmap, ldapsearch for linux to identify Windows info.
+# Using nbtscan, nmap, smbclient/ldapsearch for linux to identify Windows info.
 # Given an IP address range, following will be identified:
 # - NetBIOS name
 # - FQDN hostname
 # - Domain/Workgroup Name
 # - Role of host (DC, Domain Member Server, Workgroup Server)
 # - Operating System (SP?)
-
+#
+# This tool may be used for legal purposes only.  Users take full responsibility
+# for any actions performed using this tool.  The author accepts no liability
+# for damage caused by this tool.  If these terms are not acceptable to you, then
+# you are not permitted to use this tool.
+#
+# In all other respects the GPL version 2 applies:
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+#
 # Use Perl Modules 
 # Note to check following:
 # 1. Perl installed (perl -v)
-# 2. Perl modules installed (e.g. CPAN; install File::Which.pm)
-# 3. External Programs exist (i.e. --depend or manually nbtscan, nmap, etc)
+# 2. External Programs exist (i.e. --depend or manually nbtscan, nmap, etc)
 use strict;
 use warnings;
 use 5.010;
@@ -22,7 +44,7 @@ use Data::Dumper qw(Dumper);
 use Getopt::Long qw(GetOptions);
 
 # Constants Defined
-use constant VERSION => 0.01;
+use constant VERSION => 0.02;
 
 # Execution Start Time
 my $exectime=time();
@@ -34,11 +56,13 @@ my $flag_help; my $flag_version;
 my $flag_csv; my $flag_table;
 my $flag_outall; my $flag_outcsv; my $flag_outtable;
 my $flag_debug; my $flag_depend; my $flag_ldap;
+my $str_input;
 GetOptions( "h|?|help"  =>  \$flag_help
 	,"v|version"  =>  \$flag_version
 	,"c|csv"  =>  \$flag_csv
 	,"d|debug"  =>  \$flag_debug 
 	,"depend"  =>  \$flag_depend
+	,"i|input=s"  =>  \$str_input
 	,"l|ldap"  =>  \$flag_ldap
 	,"o|outall"  =>  \$flag_outall
 	,"outcsv"  =>  \$flag_outcsv
@@ -57,8 +81,7 @@ if ($flag_depend) { runDependency(); exit; }
 getVersion() and exit if $flag_version;
 
 # Help Option (also display when no arguments supplied)
-getHelp() and exit if $flag_help or scalar @ARGV==0;
-
+getHelp() and exit if $flag_help or (scalar @ARGV==0 and !$str_input);
 
 # Get $ARGV[0] (only 1 variable used)
 # ERROR! $ips=@ARGV if $#ARGV>0; ERROR!
@@ -67,17 +90,21 @@ getHelp() and exit if $flag_help or scalar @ARGV==0;
 my $ips="";
 $ips=$ARGV[0];
 
-# DEBUG print
-print "[DEBUG] @ARGV\n" if $flag_debug;
-print "[DEBUG] $ips is a valid IP address\n" if $flag_debug && validIP($ips);
-print "[DEBUG] $ips is a valid dash IP address range\n" if $flag_debug && validRangeDash($ips);
-print "[DEBUG] $ips is a valid slash IP address range\n" if $flag_debug && validRangeSlash($ips);
-
 # check if $ips is a valid IP or range
-die "$ips is not valid argument. Argument must be an IP address or range.\n" unless validRangeDash($ips) || validRangeSlash($ips) || validIP($ips);
+die "$ips is not valid argument. Argument must be an IP address or range.\n" unless $str_input || validRangeDash($ips) || validRangeSlash($ips) || validIP($ips);
 
 # print Dumper \%found;
-my %found=enumHosts($ips);
+my %found;
+if ($str_input) {
+   %found=enumFile($str_input);
+} else {
+   # DEBUG print
+   print "[DEBUG] @ARGV\n" if $flag_debug;
+   print "[DEBUG] $ips is a valid IP address\n" if $flag_debug && validIP($ips);
+   print "[DEBUG] $ips is a valid dash IP address range\n" if $flag_debug && validRangeDash($ips);
+   print "[DEBUG] $ips is a valid slash IP address range\n" if $flag_debug && validRangeSlash($ips);
+   %found=enumHosts($ips);
+}
 my $outputCSV=printCSV(%found);
 my $outputTable=printTable(%found);
 
@@ -112,20 +139,76 @@ sub enumHosts {
       foreach (@nbtscan_results) {print "[DEBUG] $_";}
    }
 
-   # Process nbtscan_results
-   %found=processNBT(@nbtscan_results);
-   # Process nmap-smb-os-discovery results
-   %found=processSMB(%found);
-   # Process ldapsearch results
-   %found=processLDAP(%found) if $flag_ldap;
+   # Process Hosts
+   %found=processHosts(@nbtscan_results);
 
    return %found;
 }
 
 
-# processNBT
-# Take array of nbtscan results and do something
-sub processNBT{
+# enumFile
+# - enumFile of IP address given $fileinput
+# - return %hashes
+sub enumFile {
+   my ($fileinput) = @_;
+   my @lines=readFile($fileinput);
+   my %found;
+   my @nbtscan_results; my @nbtscan1;
+
+   foreach my $ip (@lines) {
+      chomp $ip;
+      if (validIP($ip)) {
+         @nbtscan1=qx/nbtscan -vv -h -s \":\" $ip/;
+         splice @nbtscan_results, scalar @nbtscan_results, 0, @nbtscan1;
+         # Debug: echo back nbtscan
+         # print Dumper \@nbtscan1;
+         if ($flag_debug) {
+            print "[DEBUG]\n[DEBUG] nbtscan -vv -h -s \":\" $ip\n";
+            foreach (@nbtscan1) {print "[DEBUG] $_";}
+         }
+      } else {
+         if ($flag_debug) {
+            print "[DEBUG]\n[DEBUG] nbtscan -vv -h -s \":\" $ip\n";
+            print "[DEBUG] $ip is not a valid IP address.\n";
+         }
+      }
+   }
+
+   # Process Hosts
+   %found=processHosts(@nbtscan_results);
+
+   return %found;
+}
+
+
+# processHosts
+# Take array of nbtscan results and create %found of hosts and run appropriate
+# tools to get further information, i.e. nmap smb-os-discovery (default) or
+# ldapsearch/smblicent (ldap). Returns %found.
+sub processHosts {
+   my (@nbtscan_results)=@_;
+   my %found;
+
+   # Process nbtscan_results
+   %found=processNbtscan(@nbtscan_results);
+
+   if ($flag_ldap) {
+      # Process smbclient results
+      %found=processSmbclient(%found);
+      # Process ldapsearch results
+      %found=processLDAP(%found);
+   } else {
+      # Process nmap-smb-os-discovery results
+      %found=processNmapSMB(%found);
+   }
+
+   return %found;
+}
+
+
+# processNbtscan
+# Take array of nbtscan results and produce a %found hash array
+sub processNbtscan{
    my (@nbtscan_results)=@_;
    my %found;
    my @line;
@@ -187,11 +270,12 @@ sub processNBT{
 }
 
 
-# processSMB
+# processNmapSMB
 # - process SMB OS Discovery on found IPs
 # - nmap smb-os-discovery.nse to get OS details and FQDN
+# - adds to %found
 # - return %found
-sub processSMB {
+sub processNmapSMB {
    my (%found) = @_;
    my @smbos_results;
    my @line;
@@ -214,6 +298,45 @@ sub processSMB {
          $found{$i}{'os'}=$line[1] if $line[0]=~ /OS/;
          $found{$i}{'fqdn'}=$line[1] if $line[0]=~ /FQDN/;
       }
+
+      # Check to if OS/FQDN not observed
+      $found{$i}{'os'}="N/A" if (! exists $found{$i}{'os'});
+      $found{$i}{'fqdn'}="N/A" if (! exists $found{$i}{'fqdn'});
+   }
+   return %found;
+}
+
+
+# processSmbclient
+# - process smbclient -L on found IPs
+# - smbclient to get OS details and FQDN
+# - adds to %found
+# - return %found
+sub processSmbclient {
+   my (%found) = @_;
+   my @smbclient_results;
+   my $osmatch='OS='; my $sqbe=']';
+   my $pos1; my $pos2;
+
+   foreach my $i (sortbyIP(keys %found)) {
+      # OS is only displayed in STDERR...
+      @smbclient_results=qx!smbclient -L $i -U''%'' -c 'q' 2>&1 | grep -i $osmatch!;
+
+      # Debug: echo back smbclient results
+      if ($flag_debug) {
+         print "[DEBUG]\n[DEBUG] smbclient -L $i -U''%'' -c 'q' 2>&1 | grep -i $osmatch\n";
+         foreach (@smbclient_results) {print "[DEBUG] $_";}
+      }
+
+      foreach (@smbclient_results) {
+         $pos1=index($_,$osmatch);
+         $pos2=index($_,$sqbe,$pos1);
+         # Add 4 chars to pos to further offset, OS=[
+         $found{$i}{'os'}=substr($_,$pos1+4,$pos2-$pos1-4);
+      }
+
+      # Check to if OS/FQDN not observed
+      $found{$i}{'os'}="N/A" if (! exists $found{$i}{'os'});
    }
    return %found;
 }
@@ -221,6 +344,7 @@ sub processSMB {
 
 # processLDAP
 # - processLDAP on found IP
+# - adds to %found
 # - return %found
 sub processLDAP {
    my (%found) = @_;
@@ -236,7 +360,6 @@ sub processLDAP {
          foreach (@ldapsearch_results) {print "[DEBUG] $_";}
       }
 
-
       foreach (@ldapsearch_results) {
          @line=split(/:/,$_);
          # $line[0]=Name; $line[1]=Description;
@@ -245,6 +368,9 @@ sub processLDAP {
 
          $found{$i}{'fqdn'}=$line[1] if $line[0]=~ /dnsHostName/;
       }
+
+      # Check to if OS/FQDN not observed
+      $found{$i}{'fqdn'}="N/A" if (! exists $found{$i}{'fqdn'});
    }
    return %found;
 }
@@ -257,7 +383,7 @@ sub printCSV {
    my $csv;
 
    # Store(Print) Header
-   $csv.= "\nIP\tHostname\tGroupname\tRole\tOS\tFQDN\n";
+   $csv= "\nIP\tHostname\tGroupname\tRole\tOS\tFQDN\n";
 
    foreach my $i (sortbyIP(keys %found)) {
       # Store(Print) actual record for $i
@@ -321,8 +447,22 @@ sub printTable {
    return $table;
 }
 
+
+# readFile
+# read contents of a file in and array of @lines
+sub readFile {
+   my ($filename)=@_;
+   my(@lines);
+
+   open(INFILE, "<$filename") || return "[ERROR] $filename: $!\n";
+   @lines=<INFILE>;
+   close(INFILE);
+   return @lines;
+}
+
+
 # writeFile
-# 
+# write contents of a $str to a $filename
 sub writeFile {
    my ($str,$filename)=@_;
    $filename="default.log" if $filename eq "";
@@ -348,6 +488,7 @@ sub validIP {
    }
 }
 
+
 # sortbyIP
 # - sort array of IPs
 sub sortbyIP {
@@ -355,6 +496,7 @@ sub sortbyIP {
    my(@sorted)=map substr($_,4),sort map pack('C4a*', split(/\./), $_), @unsorted;
    return @sorted;
 }
+
 
 # validRangeDash
 # - check to see if valid range based on first part of parameter split by dash
@@ -365,6 +507,7 @@ sub validRangeDash {
    return validIP($dashed[0]);
 }
 
+
 # validRangeSlash
 # - check to see if valid range based on first part of parameter split by slash
 sub validRangeSlash {
@@ -373,6 +516,7 @@ sub validRangeSlash {
    my @slashed = split /\//, $range;
    return validIP($slashed[0]);
 }
+
 
 # runDependency
 sub runDependency {
@@ -390,6 +534,7 @@ sub runDependency {
 
 }
 
+
 # getVersion
 sub getVersion {
 my $prog="host_enum.pl";
@@ -399,22 +544,38 @@ $prog v$version
 VERS
 }
 
+
 # getHelp
 sub getHelp {
 my $prog="host_enum.pl";
 my $version=VERSION;
 print <<HELP;
-$prog v$version
-$prog -? -h --help	Help
-$prog -v --version	Version Info
-$prog -d --debug	Debug/Verbose Mode
-$prog --depend	Check Dependencies
-$prog -l --ldap	Run with ldapsearch
-$prog --csv	Print final results in CSV format
-$prog --table	Print final results in table format
-$prog -o --outall	Dump output to file all formats
-$prog --outcsv	Dump output to file (output.csv) in CSV format
-$prog --outtable	Dump output to file (output.txt) in table format
+$prog v$version  Copyright (C) 2019 Benedict Lam-Hang
+Host enumeration script that gather details for given IP addresses.
+
+This is a free software and it comes with absolutely no warranty.
+You can use, distribute and modify it under terms of GNU GPL.
+
+Usage: $prog [-?|-h|--help] [-v|--version] [-d|--debug] [--depend]
+	[-i|--input=FILE] [-l|--ldap] [-c|--csv] [-t|--table] [-o|--outall]
+	[--outcsv] [--outtable]
+
+Help options:
+  -?, -h, --help       Shows this help message
+  -v, --version	       Print version
+  -d, --debug          Debug output including output from wrapped commands
+  --depend             Check dependencies to see which commands are missing
+
+Input options:
+  -i, --input=FILE     Input from list of IP addresses in a file
+  -l, --ldap           Perform ldapsearch/smbclient instead of nmap (default)
+
+Output options:
+  -c, --csv            Dump output to screen in CSV format
+  -t, --table          Dump output to screen in table format
+  -o, --outall	       Dump output to file all formats	
+  --outcsv             Dump output to file (output.csv) in CSV format
+  --outtable           Dump output to file (output.txt) in table format
 HELP
 }
 
